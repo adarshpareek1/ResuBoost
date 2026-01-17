@@ -1,13 +1,11 @@
 from langgraph.graph import StateGraph, START, END
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEndpointEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from dotenv import load_dotenv
 import os, json, re, time
 from typing import TypedDict, Dict, Any
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from huggingface_hub import InferenceClient
 
 load_dotenv()
 
@@ -17,15 +15,29 @@ try:
 except:
     HF_TOKEN = os.getenv("HF_TOKEN")
 
-llm = HuggingFaceEndpoint(
-    repo_id="mistralai/Mixtral-8x7B-Instruct-v0.1",
-    task="text-generation",
-    max_new_tokens=512,
-    do_sample=True,
-    provider="auto",
-)
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN missing. Add it in Streamlit secrets or .env.")
 
-model = ChatHuggingFace(llm=llm)
+LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+hf_client = InferenceClient(model=LLM_MODEL, token=HF_TOKEN)
+
+
+def hf_generate(prompt: str) -> str:
+    last_err = None
+    for attempt in range(4):
+        try:
+            resp = hf_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=512,
+                temperature=0.0
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError("HF inference failed after retries.") from last_err
+
 
 class ResumeEvalState(TypedDict):
     resume_text: str
@@ -35,45 +47,48 @@ class ResumeEvalState(TypedDict):
     report: str
     improvements: str
 
-def load_idx_resume(state: ResumeEvalState) -> ResumeEvalState:
-    resume_text = state['resume_text']
 
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+def extract_json(raw: str) -> Dict[str, Any]:
+    raw = raw.strip()
+    raw = re.sub(r"```json", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"```", "", raw).strip()
+
+    try:
+        return json.loads(raw)
+    except:
+        pass
+
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except:
+            pass
+
+    return {}
+
+
+def load_idx_resume(state: ResumeEvalState) -> ResumeEvalState:
+    resume_text = state["resume_text"]
+
+    emb_model = "sentence-transformers/all-MiniLM-L6-v2"
     hf_embeddings = HuggingFaceEndpointEmbeddings(
-        model=model_name,
+        model=emb_model,
         task="feature-extraction",
-        huggingfacehub_api_token=HF_TOKEN
+        huggingfacehub_api_token=HF_TOKEN,
     )
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs = text_splitter.create_documents([resume_text])
-    vectorstore = FAISS.from_documents(docs, hf_embeddings)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = splitter.create_documents([resume_text])
 
+    vectorstore = FAISS.from_documents(docs, hf_embeddings)
     return {**state, "vectorstore": vectorstore}
+
 
 def generate_score_and_report(state: ResumeEvalState) -> ResumeEvalState:
     vectorstore = state["vectorstore"]
     job_description = state["job_description"]
-    retriever = vectorstore.as_retriever(k=5)
-
-    system_prompt = (
-        "You are an expert resume evaluator. Compare the candidate's resume excerpts "
-        "to the job description and output your answer ONLY as a JSON object:\n\n"
-        "{{\n"
-        '  "score": <integer from 0 to 100>,\n'
-        '  "report": "<3–4 paragraphs explaining key strengths and gaps>"\n'
-        "}}\n\n"
-        "Be concise, factual, and base your evaluation strictly on the provided resume context."
-    )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", (
-            "Job Description:\n---\n{job_description}\n---\n\n"
-            "Evaluate the candidate's resume excerpts below for fit:\n"
-            "{context}"
-        )),
-    ])
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
     def _try_once() -> Dict[str, Any]:
         retrieved_docs = retriever.invoke(job_description)
@@ -82,80 +97,82 @@ def generate_score_and_report(state: ResumeEvalState) -> ResumeEvalState:
 
         context = "\n\n".join([d.page_content for d in retrieved_docs])
 
-        rag_chain = (prompt | model.bind(stop=["<|eot_id|>", "<|end_of_text|>"]) | StrOutputParser())
-        raw_output = rag_chain.invoke({"job_description": job_description, "context": context})
+        full_prompt = f"""
+You are an expert resume evaluator.
 
-        try:
-            result = json.loads(raw_output.strip())
-        except json.JSONDecodeError:
-            match = re.search(r'\{[^{}]*"score"[^{}]*"report"[^{}]*\}', raw_output, re.DOTALL)
-            if not match:
-                match = re.search(r'\{.*?\}', raw_output, re.DOTALL)
-            
-            if match:
-                try:
-                    result = json.loads(match.group(0))
-                except Exception:
-                    result = {}
-            else:
-                score_match = re.search(r'"score"\s*:\s*(\d+)', raw_output)
-                report_match = re.search(r'"report"\s*:\s*"([^"]+)"', raw_output, re.DOTALL)
-                
-                if score_match and report_match:
-                    result = {
-                        "score": int(score_match.group(1)),
-                        "report": report_match.group(1)
-                    }
-                else:
-                    result = {}
+Return ONLY valid JSON. No markdown. No explanation.
+Return STRICT JSON only. If unsure, still output valid JSON.
+Format exactly:
+{{ "score": <integer 0-100>, "report": "<3-4 paragraphs>" }}
 
-        if isinstance(result, dict) and "score" in result and "report" in result:
-            return result
-        else:
-            raise ValueError(f"Invalid or missing keys. Got: {list(result.keys())}")
+Job Description:
+---
+{job_description}
+---
+
+Resume Context:
+---
+{context}
+---
+"""
+
+        raw_output = hf_generate(full_prompt)
+        parsed = extract_json(raw_output)
+
+        if "score" not in parsed or "report" not in parsed:
+            raise ValueError("Invalid JSON output")
+
+        score = max(0, min(100, int(parsed["score"])))
+        report = str(parsed["report"]).strip()
+
+        if not report:
+            raise ValueError("Empty report")
+
+        return {"score": score, "report": report}
 
     for attempt in range(3):
         try:
             result = _try_once()
-            if result["score"] >= 0:  
-                return {**state, "score": result["score"], "report": result["report"]}
+            return {**state, "score": result["score"], "report": result["report"]}
         except Exception:
-            if attempt < 2:  
+            if attempt < 2:
                 time.sleep(2 ** attempt)
 
     return {**state, "score": 0, "report": "Evaluation failed — model could not produce valid output."}
 
 
 def generate_suggestions(state: ResumeEvalState) -> ResumeEvalState:
-    report = state["report"]
+    report = state.get("report", "")
     job_description = state["job_description"]
-    score = state["score"]
+    score = state.get("score", 0)
 
-    system_prompt = (
-        "You are an expert career coach and resume writer. Based on the evaluation report "
-        "and the job description, provide 5–8 SPECIFIC, actionable suggestions to improve "
-        "the candidate's resume. Output in a clear bullet list format."
-    )
+    if "Evaluation failed" in report:
+        return {**state, "improvements": "Unable to generate suggestions at this time."}
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", (
-            "Candidate Score: {score}/100\n\n"
-            "Job Description:\n---\n{job_description}\n---\n\n"
-            "Evaluation Report:\n---\n{report}\n---\n\n"
-            "Now list improvements:"
-        )),
-    ])
+    full_prompt = f"""
+You are an expert career coach and resume writer.
 
-    suggestion_chain = (prompt | model.bind(stop=["<|eot_id|>", "<|end_of_text|>"]) | StrOutputParser())
-    
+Give 5–8 specific actionable suggestions to improve the resume.
+Return ONLY bullet points.
+
+Candidate Score: {score}/100
+
+Job Description:
+---
+{job_description}
+---
+
+Evaluation Report:
+---
+{report}
+---
+"""
+
     try:
-        suggestions_text = suggestion_chain.invoke({
-            "score": score,
-            "job_description": job_description,
-            "report": report
-        })
-        return {**state, "improvements": suggestions_text}
+        suggestions = hf_generate(full_prompt).strip()
+        if not suggestions:
+            raise ValueError("Empty suggestions")
+        return {**state, "improvements": suggestions}
     except Exception:
         return {**state, "improvements": "Unable to generate suggestions at this time."}
 
@@ -164,8 +181,9 @@ def format_final_output(state: ResumeEvalState) -> Dict[str, Any]:
     return {
         "score": state.get("score", 0),
         "report": state.get("report", "No report generated."),
-        "improvements": state.get("improvements", "No suggestions available.")
+        "improvements": state.get("improvements", "No suggestions available."),
     }
+
 
 workflow = StateGraph(ResumeEvalState)
 

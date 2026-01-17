@@ -86,7 +86,7 @@ if evaluate_btn:
     elif not job_description:
         st.error("⚠️ Please provide a job description!")
     else:
-        with st.spinner("🔄 Analyzing your resume... This may take 30-60 seconds"):
+        with st.spinner("🔄 Analyzing your resume... This may take 1-2 minutes"):
             try:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
